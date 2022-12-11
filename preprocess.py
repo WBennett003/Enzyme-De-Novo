@@ -1,26 +1,11 @@
 import json
 import numpy as np
+from tokeniser import Element_Tokeniser, Theozyme_Tokeniser
 
-PERIODIC_TABLE = {
-    'H' : 0,
-    'C' : 1,
-    'N' : 2,
-    'O' : 3,
-    'S' : 4,
-    'R' : 5,
-    'Fe' : 6,
-    'Mg' : 7,
-    'Zn' : 8,
-    'P' : 9,
-    'Se' : 10,
-    '*' : 11,
-    'R#' : 12,
-    'Cu' : 13,
-    'Cl' : 14,
-    'R1' : 15
-}
+ELEMENT_TOKENISER = Element_Tokeniser('datasets/PERIODIC.json')
+THEOZYME_TOKENISER = Theozyme_Tokeniser('datasets/THEOZYME.json')
 
-def get_reactions(path='X_dataset.json'):
+def get_reactions(path='datasets/X_dataset.json'):
     with open(path, 'r') as file:
         d = json.load(file)
     return d
@@ -36,12 +21,13 @@ def create_matrix_from_mol(chebi_id, path='molecules'):
     F = []
     A = np.zeros((n_atoms, n_atoms, 2))
 
-    for i in range(4, 4+n_atoms): #TODO: need to add charge and mass to feature array instead of element embedding
+    for i in range(4, 4+n_atoms): #TODO: need to add mass to feature array instead of element embedding
         line = lines[i]
         x = float(line[:10])
         y = float(line[10:20])
         z = float(line[20:30])
-        E = PERIODIC_TABLE[line[30:33].replace(' ', '')]
+        E = line[30:33].replace(' ', '')
+        E = ELEMENT_TOKENISER.tokenise(E)
         C = 0
         F.append([E, x, y, z, C])
 
@@ -57,6 +43,18 @@ def create_matrix_from_mol(chebi_id, path='molecules'):
         A[i,j][1] = s
         A[j,i][0] = t
         A[j,i][1] = s
+
+    count = 4+n_atoms+n_bonds+1
+    done = False
+    while not done and count != len(lines): #adds chg by the ending
+        line = lines[count]
+        if line[3:6] == 'END':
+            done = True
+        elif line[3:6] == 'CHG':
+            i = int(line[9:13]) - 1
+            c = int(line[13:17])
+            F[i][4] = c
+        count += 1
 
 
 
@@ -94,14 +92,30 @@ def create_system(compounds):
     system_F, system_A = create_system_matrix(Fs, As)   
     return system_F, system_A
 
-def generate_dataset(filename='X_processed_dataset.json'):
+def preprocess_residue(residues):
+    temp = []
+    for res in residues:
+        i = res[0]
+        AA = res[1]
+        AA = Theozyme_Tokeniser.tokenise(AA) #converts string to index for one hot embedding
+        atom = res[2]
+        atom = Element_Tokeniser.tokenise(atom)
+        x, y, z, t = res[3], res[4], res[5], res[6] #TODO: add position normalisation
+        
+def preprocess_compound(compound):
+    return compound
+    
+def generate_dataset(filename='datasets/X_processed_dataset.json'):
     d = get_reactions()
     dataset = {}
+
+
     for r in d:
         dataset[r] = {
             'reactants' : {},
-            'products'  : {}}
-        reactants = d[r]['reactants']
+            'products'  : {},
+            }
+        reactants = d[r]['reactants'] #TODO: add coordiante normalisation
         F, A = create_system(reactants)
         dataset[r]['reactants']['F'] = F
         dataset[r]['reactants']['A'] = A.tolist()
@@ -110,11 +124,12 @@ def generate_dataset(filename='X_processed_dataset.json'):
         F, A = create_system(products)
         dataset[r]['products']['F'] = F 
         dataset[r]['products']['A'] = A.tolist()
-    
+
+        dataset[r]['residues'] = preprocess_residue(d[r]['residues']) 
+
     with open(filename, 'w+') as file:
         json.dump({'X' : dataset}, file)
     return dataset
 
 if __name__ == '__main__':
     generate_dataset()
-    F, A = create_system(['1480', '58601'])
