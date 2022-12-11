@@ -95,13 +95,16 @@ def create_system(compounds):
 def preprocess_residue(residues):
     temp = []
     for res in residues:
-        i = res[0]
-        AA = res[1]
-        AA = Theozyme_Tokeniser.tokenise(AA) #converts string to index for one hot embedding
-        atom = res[2]
-        atom = Element_Tokeniser.tokenise(atom)
-        x, y, z, t = res[3], res[4], res[5], res[6] #TODO: add position normalisation
-        
+        for atom in res:
+            i = atom[0]
+            AA = atom[1]
+            AA = THEOZYME_TOKENISER.tokenise(AA) #converts string to index for one hot embedding
+            elem = atom[2]
+            elem = ELEMENT_TOKENISER.tokenise(elem)
+            x, y, z, t = atom[3], atom[4], atom[5], atom[6] #TODO: add position normalisation
+            temp.append([i, AA, elem, x, y, z, t])
+    return temp
+
 def preprocess_compound(compound):
     return compound
     

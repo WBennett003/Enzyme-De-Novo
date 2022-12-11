@@ -2,8 +2,8 @@ import requests
 import json 
 import os
 
-def download_molecule(chebi_id, path='molecules'):
-    if not os.path.isfile(path+'/'+chebi_id+'.mol'):
+def download_molecule(chebi_id, path='molecules/'):
+    if not os.path.isfile(path+chebi_id+'.mol'):
         url = f'http://www.ebi.ac.uk/thornton-srv/m-csa/media/compound_mols/{chebi_id}.mol'
         data = requests.get(url).text
         with open(path+'/'+chebi_id+'.mol', 'w+') as file:
@@ -63,15 +63,15 @@ def process_compounds(sample):
     temp['residues'].append(res_pos)
     return temp
 
-def process_all_compounds(filename='enzyme_dataset.json'):
-    with open(filename, 'r') as file:
+def process_all_compounds(source_filename='enzyme_dataset.json', output_filename='X_dataset.json', path='datasets/'):
+    with open(path+source_filename, 'r') as file:
         d = json.load(file)
         new = {}
         for i in d:
             sample = d[i]
             new[i] = process_compounds(sample)
                 
-    with open('X_dataset.json', 'w+') as file:
+    with open(path+output_filename, 'w+') as file:
         json.dump(new, file) 
 
 def process_enzymes(sample):
@@ -126,7 +126,7 @@ def clean_d(results):
 def make_dataset():
     d = get_enzymedata()
     d = clean_d(d)
-    with open('enzyme_dataset.json', 'w+') as f:
+    with open('datasets/enzyme_dataset.json', 'w+') as f:
         json.dump(d, f)
     
 if __name__ == '__main__':
