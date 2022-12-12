@@ -21,6 +21,7 @@ def download_protein(pdb_code, path='proteins/'):
  
 def process_compounds(sample):
     compound = sample['compounds']
+    
     temp = {}
     temp['reactants'] = []
     temp['products'] = []
@@ -37,16 +38,33 @@ def process_compounds(sample):
             for i in range(count):
                 temp['products'].append(chem_id)
 
+    if len(temp['reactants']) == 0:
+        print(f"Error, no reactants found : \n {sample}")
+        return {"Error" : "No reactants"}
+
+    if len(temp['products']) == 0:
+        print(f"Error, no products found : \n {sample}")
+        return {"Error" : "No products"}
+
+
+
     residues = sample['residues']
     ress = residues[0]
+    ress_dict = dict(ress)
+    INDEXES = set([i[0] for i in ress])
+    RESIDUES = set([i[1] for i in ress])
+
+
     pdb = residues[1]
-    if len(pdb) == 1:
+    if len(pdb) > 1:
         pdb = pdb[0]
     else:
         pdb = pdb[0]
 
     pdb_data = download_protein(pdb)
     atoms = pdb_data.split('\n')
+    found_residues = set()
+    mutations = []
     res_pos = []
     for atom in atoms:
         if atom[:4] == 'ATOM':
@@ -57,20 +75,37 @@ def process_compounds(sample):
             y = float(atom[38:46])
             z = float(atom[46:55])
             t = float(atom[60:66])
-            if [i, r] in ress:
-                res_pos.append([i, r, a, x, y, z, t])
+            if i in INDEXES:
+                if r in RESIDUES:
+                    found_residues.add(i)
+                    res_pos.append([i, r, a, x, y, z, t])
+                else:
+                    mutations.append([i, ress_dict[i], r])
+                    # print(f"Wrong residue at position {i} should be {ress_dict[i]} instead {r}")
     
+    if (found_residues != INDEXES and len(mutations) > 0) or len(res_pos) == 0:
+        print(f"Error, pdb {pdb} appears to have missing residues or incorrect residues \n {mutations}")
+        return {"Error" : ["pdb does not contain active site atoms", mutations]}
+
+
     temp['residues'].append(res_pos)
+    
     return temp
 
 def process_all_compounds(source_filename='enzyme_dataset.json', output_filename='X_dataset.json', path='datasets/'):
     with open(path+source_filename, 'r') as file:
         d = json.load(file)
+        skipped = 0
         new = {}
         for i in d:
             sample = d[i]
-            new[i] = process_compounds(sample)
-                
+            out = process_compounds(sample)
+            if "Error" not in out.keys():
+                 new[i] = out
+            else:
+                skipped += 1
+                print(f"skipping {i}")
+        print(f"skipped {skipped}/{len(d)}")
     with open(path+output_filename, 'w+') as file:
         json.dump(new, file) 
 
@@ -96,6 +131,10 @@ def get_mechanism(result): #returns description of mechanisms
 
 def get_theozyme(result): # returns 2 tuple of (RES, ID)
     residue = result['residues']
+
+    if len(residue) == 0:
+        print(f"Error, sample has missing residues :\n {residue}")
+
     temp = []
     pdb = set()
     for res in residue:
@@ -104,6 +143,10 @@ def get_theozyme(result): # returns 2 tuple of (RES, ID)
             temp.append((r['resid'], r['code']))
             pdb.add(res['residue_chains'][i]['pdb_id'])
         # temp.append(_)
+
+    if len(pdb) == 0 or len(temp) == 0:
+        print(f"Error, sample has missing pdb or residue atoms :\n pdb : {pdb} \n res atoms : {temp}")
+    
     return [temp, list(pdb)]
 
 def get_residues(result):

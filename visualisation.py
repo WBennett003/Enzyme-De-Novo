@@ -47,4 +47,5 @@ if __name__ =='__main__':
     with open('datasets/X_processed_dataset.json') as f:
         test = json.load(f)
     
-    plot_sample(test['X']["1"])
+    for i in range(1, 100):
+        plot_sample(test['X'][str(i)])

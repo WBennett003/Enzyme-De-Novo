@@ -1,6 +1,8 @@
 import json
 import numpy as np
+
 from tokeniser import Element_Tokeniser, Theozyme_Tokeniser
+
 
 ELEMENT_TOKENISER = Element_Tokeniser('datasets/PERIODIC.json')
 THEOZYME_TOKENISER = Theozyme_Tokeniser('datasets/THEOZYME.json')
@@ -114,22 +116,32 @@ def generate_dataset(filename='datasets/X_processed_dataset.json'):
 
 
     for r in d:
-        dataset[r] = {
-            'reactants' : {},
-            'products'  : {},
-            }
+        
         reactants = d[r]['reactants'] #TODO: add coordiante normalisation
         F, A = create_system(reactants)
-        dataset[r]['reactants']['F'] = F
-        dataset[r]['reactants']['A'] = A.tolist()
+        RF = F
+        RA = A.tolist()
 
         products = d[r]['products'] 
         F, A = create_system(products)
-        dataset[r]['products']['F'] = F 
-        dataset[r]['products']['A'] = A.tolist()
+        PF = F 
+        PA = A.tolist()
 
-        dataset[r]['residues'] = preprocess_residue(d[r]['residues']) 
+        res = preprocess_residue(d[r]['residues']) 
 
+        if len(RF) != 0 and len(PF) != 0 and len(RA) != 0 and len(PA) != 0 and len(res) != 0:
+            dataset[r] = {
+            'reactants' : {},
+            'products'  : {},
+            }
+            dataset[r]['reactants']['F'] = RF
+            dataset[r]['reactants']['A'] = RA
+            dataset[r]['products']['F'] = PF
+            dataset[r]['products']['A'] = PA
+            dataset[r]['residues'] = res
+        else:
+            print(f"sample {r} has missing products, reactants or active site")
+            
     with open(filename, 'w+') as file:
         json.dump({'X' : dataset}, file)
     return dataset
