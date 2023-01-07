@@ -3,6 +3,10 @@ import os
 
 
 class Element_Tokeniser():
+    position_chars = [
+        'A', 'B', 'G', 'D', 'E', 'Z'
+    ]
+
     def __init__(self, dict_path='PERIODIC.json'):
         self.dict_path = dict_path
         if not os.path.isfile(self.dict_path):
@@ -11,12 +15,20 @@ class Element_Tokeniser():
             with open(self.dict_path, 'r') as f:
                 self.PERIODIC_TABLE = json.load(f)
 
-        self.elements = self.PERIODIC_TABLE.keys()
+    def clean_element_name(self, element):
+        element = element.replace(' ', '')
+        if len(element) > 1:
+            if element[1] in self.position_chars:
+                return element[0]
+            else:
+                return element
+        else:
+            return element
 
     def tokenise(self, element):
-        element = element.replace(' ', '')
-        if element.capitalize() not in self.elements:
-            n = len(self.elements)
+        element = self.clean_element_name(element)
+        if element not in self.PERIODIC_TABLE.keys():
+            n = len(self.PERIODIC_TABLE.keys())
             self.PERIODIC_TABLE[element] = n
             self.update_table()
         else:

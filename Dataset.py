@@ -2,307 +2,226 @@ import numpy as np
 import requests
 import json 
 import os
+import h5py
 
+from sklearn.preprocessing import StandardScaler
 
-from rdkit import Chem
-from rdkit.Chem import AllChem
-
+from utils import download_molecule, fetch_molecules, dense_bonding, combine_square_matrix, create_graph_from_mol, get_theozyme, download_protein, mask_bond_vectors
 from tokeniser import Element_Tokeniser, Theozyme_Tokeniser
+from Bonder import Builder
 
 ELEMENT_TOKENISER = Element_Tokeniser('datasets/PERIODIC.json')
 THEOZYME_TOKENISER = Theozyme_Tokeniser('datasets/THEOZYME.json')
 
-def download_molecule(chebi_id, path='molecules/'):
-    if not os.path.isfile(path+chebi_id+'.mol'):
-        url = f'http://www.ebi.ac.uk/thornton-srv/m-csa/media/compound_mols/{chebi_id}.mol'
-        data = requests.get(url).text
-
-        mol = Chem.MolFromMolBlock(data)
-        mol = Chem.AddHs(mol)
-        try: #TODO: need to make this more robust
-            AllChem.EmbedMolecule(mol)
-        except RuntimeError as e:
-            data = data
-        data = Chem.MolToMolBlock(mol)
-
-        with open(path+'/'+chebi_id+'.mol', 'w+') as file:
-            file.write(data)
-
-def download_protein(pdb_code, path='proteins/'):
-    if not os.path.isfile(path+pdb_code+'.pdb'):
-        pdb = (requests.get('https://files.rcsb.org/download/'+pdb_code+'.pdb').content).decode('UTF-8')
-        with open(path+pdb_code+'.pdb', 'w+') as f:
-            f.write(pdb)
-    else:
-        with open(path+pdb_code+'.pdb', 'r') as f:
-            pdb = f.read()
-    return pdb
-
-
-def create_matrix_from_mol(chebi_id, path='molecules'):
-
-    with open(path+'/'+chebi_id+'.mol', 'r') as file:
-        lines = file.readlines()
-
-    n_atoms = int(lines[3][:3])
-    n_bonds = int(lines[3][3:6])
-
-    F = []
-    A = np.zeros((n_atoms, n_atoms, 2))
-
-    for i in range(4, 4+n_atoms): #TODO: need to add mass to feature array instead of element embedding
-        line = lines[i]
-        x = float(line[:10])
-        y = float(line[10:20])
-        z = float(line[20:30])
-        E = line[30:33].replace(' ', '')
-        E = ELEMENT_TOKENISER.tokenise(E)
-        C = 0
-        F.append([E, x, y, z, C])
-
-    for n in range(4+n_atoms, 4+n_atoms+n_bonds):
-        line = lines[n]
-        i = int(line[:3])-1 #first atom
-        j = int(line[3:6])-1 # second atom
-        t = int(line[6:9]) # type of bond, single doubel tripple or aromatic
-        s = int(line[9:12]) #sterisomerism of bond
-
-        # since its pairwise its synmetrical and so Aij = Aji
-        A[i,j][0] = t
-        A[i,j][1] = s
-        A[j,i][0] = t
-        A[j,i][1] = s
-
-    count = 4+n_atoms+n_bonds+1
-    done = False
-    while not done and count != len(lines): #adds chg by the ending
-        line = lines[count]
-        if line[3:6] == 'END':
-            done = True
-        elif line[3:6] == 'CHG':
-            i = int(line[9:13]) - 1
-            c = int(line[13:17])
-            F[i][4] = c
-        count += 1
-
-    return F, A.tolist()
-
-def create_system_matrix(Fs, As):
-    #Fs is a list of Features of a molecule, As are ajacency Matrices of a molecule
-    n = len(Fs)
-    Master_F = []
-    A_sizes = []
-    for i in range(n):
-        F, A = Fs[i], As[i]
-        
-        Master_F.extend(F) # TODO: need to make cooridinates from two molecules not overlap or interact
-        A_sizes.append(A.shape[0])
-    
-    size = sum(A_sizes)
-    Master_A = np.zeros((size, size, 2))
-
-    last_step = 0
-    for i,A in enumerate(As):
-        step = last_step+A_sizes[i]
-        Master_A[last_step:step, last_step:step] = A
-        last_step = step
-    
-    return Master_F, Master_A
-
-def create_system(compounds):
-    Fs = []
-    As = []
-    for compound in compounds:
-        F, A = create_matrix_from_mol(compound)
-        Fs.append(F), As.append(A)
-
-    # system_F, system_A = create_system_matrix(Fs, As)   
-    return Fs, As
-
-def preprocess_residue(theo):
-    temp = []
-    for residues in theo:
-        for res in residues:
-            for atom in residues[res]:
-                i = atom[0]
-                AA = atom[1]
-                AA = THEOZYME_TOKENISER.tokenise(AA) #converts string to index for one hot embedding
-                elem = atom[2]
-                elem = ELEMENT_TOKENISER.tokenise(elem)
-                x, y, z, t = atom[3], atom[4], atom[5], atom[6] #TODO: add position normalisation
-                temp.append([i, AA, elem, x, y, z, t])
-    return temp
-
 class Collector():
-    def __init__(self, enzyme_url='https://www.ebi.ac.uk/thornton-srv/m-csa/api/entries/?format=json'):
-        self.enzyme_response = self.get_enzymedata(enzyme_url)
-        self.raw_enzyme_data = self.extract_features() #contains the mol and pdb files involved with the enzymes 
-        self.enzyme_data_index = self.process_enzyme_data()
-        self.enzyme_dataset = self.generate_dataset()
+    def __init__(self, COMPOUND_SIZE=1000,
+    COMPOUND_CHANNELS=5, THEOZYME_SIZE=1000, THEOZYME_CHANNELS=7, N_BOND_TYPES=8,
+    N_STERO_TYPES=8, CHARGE_RANGE=(-4,+4),file_dir='datasets/dense_bonding10page.h5py',
+     enzyme_url='https://www.ebi.ac.uk/thornton-srv/m-csa/api/entries/?format=json'):
+        self.COMPOUND_SIZE = COMPOUND_SIZE
+        self.COMPOUND_CHANNELS = COMPOUND_CHANNELS
+        self.THEOZYME_SIZE = THEOZYME_SIZE
+        self.THEOZYME_CHANNELS = THEOZYME_CHANNELS
+        self.N_BOND_TYPES = N_BOND_TYPES
+        self.N_STERO_TYPES = N_STERO_TYPES
+        self.CHARGE_RANGE = CHARGE_RANGE
+        self.enzyme_url = enzyme_url
 
-    def get_enzymedata(self, url):
+        self.scaler = StandardScaler()
+        self.builder = Builder()
+        self.file = h5py.File(file_dir, 'w')
+
+        self.process_response(11)
+        self.close_file()
+
+    def combine_compounds(self, compounds):
+        compound_elem = []
+        compound_pos = []
+        compound_charge = []
+        compound_bond_index = []
+        compound_bond_types = []
+        
+        n_nodes = 0
+        for compound in compounds:
+            elem, charge, pos, bond_idx, bond_type = create_graph_from_mol(compound, self.N_BOND_TYPES, self.N_STERO_TYPES, self.CHARGE_RANGE)
+            
+            global_bond_idx = []
+            for idx in bond_idx:
+                global_bond_idx.append([idx[0]+n_nodes, idx[1]+n_nodes])
+
+            n_nodes += len(elem)
+
+            compound_elem.extend(elem)
+            compound_charge.extend(charge)
+            compound_pos.extend(pos)
+            compound_bond_index.extend(global_bond_idx)
+            compound_bond_types.extend(bond_type)
+
+        compound_adj = dense_bonding(compound_bond_index, compound_bond_types, self.COMPOUND_SIZE)
+
+        compound_elem, compound_charge, compound_pos = self.preprocess_compound(compound_elem, compound_charge, compound_pos)
+
+        return compound_elem, compound_charge, compound_pos, compound_adj
+
+
+    def get_enzymedata(self, url, i):
+        url = url + '&page=' + str(i)
         return requests.get(url).json()['results']
 
-    def get_reaction(self, result): #returns reactants and products
-        compounds = result['reaction']['compounds']
-        return compounds
+    def get_transition_state(self, rc, pc, rbidx, pbidx, rbt, pbt):
+        tc = (rc + pc) / 2 #takes the avg charge between reactant and products
+        same = []
+        different = []
+        pass
 
-    def get_theozyme(self, result): #returns 2 tuple of (RES, ID)
-        residue = result['residues']
+    def close_file(self):
+        self.file.close()
 
-        if len(residue) == 0:
-            print(f"Error, sample has missing residues :\n {residue}")
+    def preprocess_compound(self, element, charge, position):
+        max_length = self.COMPOUND_SIZE
+        assert len(element) == len(charge) and len(element) == len(position)
+        length = len(element)
 
-        temp = []
-        pdb = set()
-        for res in residue:
-            for i, r in enumerate(res['residue_sequences']):
-                temp.append((r['resid'], r['code']))
-                pdb.add(res['residue_chains'][i]['pdb_id'])
+        blank = np.zeros(max_length, dtype='int32') #np.repeat(int('-inf'), max_length)
+        blank[:length] = element
+        element = blank
 
-        if len(pdb) == 0 or len(temp) == 0:
-            print(f"Error, sample has missing pdb or residue atoms :\n pdb : {pdb} \n res atoms : {temp}")
-        
-        return [temp, list(pdb)]
+        blank = np.zeros(max_length, dtype='int32')
+        blank[:length] = charge
+        charge = blank
 
-    def extract_features(self):
-        temp = {}
-        for result in self.enzyme_response:
-            temp[result['mcsa_id']] = {}
-            temp[result['mcsa_id']]['compounds'] = self.get_reaction(result)
-            temp[result['mcsa_id']]['residues'] = self.get_theozyme(result)
-        return temp
+        blank = np.zeros((max_length, 3), dtype='float32')
+        blank[:length] = np.array(position)
+        position = blank
+        return element, charge, position
 
-    def process_compounds(self, sample):
-        compound = sample['compounds']
-        
-        temp = {}
-        temp['reactants'] = []
-        temp['products'] = []
-        temp['residues'] = []
+    def process_response(self, n=5):
+        self.file.create_dataset("reactant_elem", (0, self.COMPOUND_SIZE), dtype='i', chunks=True, maxshape=(None, self.COMPOUND_SIZE))
+        self.file.create_dataset("reactant_charge", (0, self.COMPOUND_SIZE), dtype='i', chunks=True, maxshape=(None, self.COMPOUND_SIZE))
+        self.file.create_dataset("reactant_pos", (0, self.COMPOUND_SIZE, 3), dtype='f', chunks=True, maxshape=(None, self.COMPOUND_SIZE, 3))
+        self.file.create_dataset("reactant_adj", (0, self.COMPOUND_SIZE, self.COMPOUND_SIZE) , dtype='i', chunks=True, maxshape=(None, self.COMPOUND_SIZE, self.COMPOUND_SIZE))
 
-        temp = self.fetch_molecules(compound, temp) #iterates over compounds
-
-        #Checks if reactants or products are missing
-        if len(temp['reactants']) == 0:
-            print(f"Error, no reactants found : \n {sample}")
-            return {"Error" : "No reactants"}
-
-        if len(temp['products']) == 0:
-            print(f"Error, no products found : \n {sample}")
-            return {"Error" : "No products"}
+        self.file.create_dataset("product_elem", (0, self.COMPOUND_SIZE), dtype='i', chunks=True, maxshape=(None, self.COMPOUND_SIZE))
+        self.file.create_dataset("product_charge", (0, self.COMPOUND_SIZE), dtype='i', chunks=True, maxshape=(None, self.COMPOUND_SIZE))
+        self.file.create_dataset("product_pos", (0, self.COMPOUND_SIZE, 3), dtype='f', chunks=True, maxshape=(None, self.COMPOUND_SIZE, 3))
+        self.file.create_dataset("product_adj", (0, self.COMPOUND_SIZE, self.COMPOUND_SIZE), dtype='i', chunks=True, maxshape=(None,self.COMPOUND_SIZE, self.COMPOUND_SIZE))
 
 
-
-        residues = sample['residues']
-        ress = residues[0]
-        ress_dict = dict(ress)
-        INDEXES = set([i[0] for i in ress])
-        RESIDUES = set([i[1] for i in ress])
+        self.file.create_dataset("theozyme_elem", (0, self.THEOZYME_SIZE), dtype='i', chunks=True, maxshape=(None,self.THEOZYME_SIZE))
+        self.file.create_dataset("theozyme_pos", (0, self.THEOZYME_SIZE, 3), dtype='f', chunks=True, maxshape=(None,self.THEOZYME_SIZE, 3))
+        self.file.create_dataset("theozyme_adj", (0, self.THEOZYME_SIZE, self.THEOZYME_SIZE), dtype='i', chunks=True, maxshape=(None,self.THEOZYME_SIZE,self.THEOZYME_SIZE))
 
 
-        pdb = residues[1]
-        if len(pdb) > 1:
-            pdb = pdb[0]
-        else:
-            pdb = pdb[0]
-        
-        pdb_data = download_protein(pdb)
+        for i in range(1, n):
+            print(f"Getting page {i}!")
+            self.enzyme_response = self.get_enzymedata(self.enzyme_url, i)
+            for result in self.enzyme_response:
+                # process compounds
+                compounds = result['reaction']['compounds']
+                reactants, products = fetch_molecules(compounds)
+
+                if len(reactants) == 0:
+                    print(f"Error, no reactants found")
+                    break
+
+                reactant_elem, reactant_charge, reactant_pos, reactant_adj = self.combine_compounds(reactants)
+                
+                if len(products) == 0:
+                    print(f"Error, no products found")
+                    break
+                    
+                product_elem, product_charge, product_pos, product_adj = self.combine_compounds(products)
+
+                proteins = get_theozyme(result)
+
+                for protein in proteins:
+                    elem, pos, adj = self.generate_theozyme(protein, proteins[protein])
+
+                    if isinstance(elem, type(np.array([]))):
+                        self.save_dataset('reactant_elem', reactant_elem)
+                        self.save_dataset('reactant_charge', reactant_charge)
+                        self.save_dataset('reactant_pos', reactant_pos)
+                        self.save_dataset('reactant_adj', reactant_adj)
+
+                        self.save_dataset('product_elem', product_elem)
+                        self.save_dataset('product_charge', product_charge)
+                        self.save_dataset('product_pos', product_pos)
+                        self.save_dataset('product_adj', product_adj)
+
+                        self.save_dataset('theozyme_elem', elem)
+                        self.save_dataset('theozyme_pos', pos)
+                        self.save_dataset('theozyme_adj', adj)
+
+        print(f"dataset shapes : \n {[[x, self.file[x].shape] for x in self.file.keys()]}")
+
+
+    def save_dataset(self, key, arr):
+        self.file[key].resize((self.file[key].shape[0] + 1), axis=0)
+        self.file[key][-1:] = arr
+                       
+
+    def generate_theozyme(self, pdb_id, ress, threshold=0):   
+        pdb_data = download_protein(pdb_id)
+        if pdb_data == '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">\n<html>\n  <head>\n    <title>404 Not Found</title>\n  </head>\n  <body>\n    <h1>Not Found</h1>\n    <p>The requested URL was not found on this server.</p>\n    <hr>\n    <address>RCSB PDB</address>\n  </body>\n</html>\n':
+            return 0, 0, 0
         atoms = pdb_data.split('\n')
-        found_residues = set()
         mutations = []
-        res_pos = {}
+
+        elem = []
+        res = []
+        charge = []
+        pos = []
+
+        idx = 0
+        next_res = ress[idx]
+        last_i = -1
         for atom in atoms:
             if atom[:4] == 'ATOM':
-                a = atom[13:16]
+                a = atom[13:16].replace(' ', '')
                 r = atom[17:20].capitalize()
                 i = int(atom[22:26])
                 x = float(atom[30:38])
                 y = float(atom[38:46])
                 z = float(atom[46:55])
                 t = float(atom[60:66])
-                if i in INDEXES:
-                    if r in RESIDUES:
-                        found_residues.add(i)
-                        res_id = r + str(i)
-                        if res_id not in res_pos.keys():
-                            res_pos[res_id] = []
-                        res_pos[res_id].append([i, r, a, x, y, z, t])
-                    else:
-                        mutations.append([i, ress_dict[i], r])
-                        # print(f"Wrong residue at position {i} should be {ress_dict[i]} instead {r}")
-        
-        if (found_residues != INDEXES and len(mutations) > 0) or len(res_pos) == 0:
-            print(f"Error, pdb {pdb} appears to have missing residues or incorrect residues \n {mutations}")
-            return {"Error" : ["pdb does not contain active site atoms", mutations]}
-
-
-        temp['residues'].append(res_pos)
-        
-        return temp
-
-    def fetch_molecules(self, compound, temp):
-        for c in compound:
-            count = c['count']
-            t = c['type']
-            chem_id = c['chebi_id']
-            download_molecule(chem_id) #download the molecule structure
-            if t == 'reactant':
-                for i in range(count):
-                    temp['reactants'].append(chem_id)
-            else:
-                for i in range(count):
-                    temp['products'].append(chem_id)
-        return temp
-
-    def process_enzyme_data(self):
-        skipped = 0
-        new = {}
-        for i in self.raw_enzyme_data:
-            sample = self.raw_enzyme_data[i]
-            out = self.process_compounds(sample)
-            if "Error" not in out.keys():
-                 new[i] = out
-            else:
-                skipped += 1
-                print(f"skipping {i}")
-        print(f"skipped {skipped}/{len(self.raw_enzyme_data)}")
-        return new
-    
-    def generate_dataset(self, filename='datasets/X_processed_dataset.json'):
-        d = self.enzyme_data_index
-        dataset = {}
-
-
-        for r in d:
-            reactants = d[r]['reactants'] #TODO: add coordiante normalisation
-            F, A = create_system(reactants)
-            RF = F
-            RA = A
-
-            products = d[r]['products'] 
-            F, A = create_system(products)
-            PF = F 
-            PA = A
-
-            res = preprocess_residue(d[r]['residues']) 
-
-            if len(RF) != 0 and len(PF) != 0 and len(RA) != 0 and len(PA) != 0 and len(res) != 0:
-                dataset[r] = {
-                'reactants' : {},
-                'products'  : {},
-                }
-                dataset[r]['reactants']['F'] = RF
-                dataset[r]['reactants']['A'] = RA
-                dataset[r]['products']['F'] = PF
-                dataset[r]['products']['A'] = PA
-                dataset[r]['residues'] = res
-            else:
-                print(f"sample {r} has missing products, reactants or active site")
                 
-        with open(filename, 'w+') as file:
-            json.dump({'X' : dataset}, file)
-        return dataset
+                if i != last_i and idx < len(ress)-1:
+                    idx += 1
+                    next_res = ress[idx]
+
+                elif i == next_res[0]:
+                    last_i = i
+                    if r == next_res[1]:
+                        elem.append(a)
+                        res.append(r)
+                        pos.append([x,y,z])
+                    else:
+                        print(f"wrong residue at position {i} got {r} instead of {next_res[1]}")
+                        mutations.append(next_res)
+
+
+        if len(mutations) <= threshold and len(res) != 0:
+            bond_idx, bond_types = self.builder.build_pdb2(elem, res)
+            tokenised_elem = []
+            
+            for i in range(len(elem)):
+                tokenised_elem.append(ELEMENT_TOKENISER.tokenise(elem[i]))
+            
+            n_atoms = len(elem)
+
+            zeros = np.zeros(self.THEOZYME_SIZE)#np.repeat(int('-inf'), self.THEOZYME_SIZE)
+            zeros[:len(tokenised_elem)] = tokenised_elem
+            elem = np.array(zeros)
+
+            zeros = np.repeat([0, 0, 0], self.THEOZYME_SIZE).reshape((self.THEOZYME_SIZE, 3))
+            zeros[:len(pos)] = pos
+            pos = np.array(zeros)
+
+            adj = dense_bonding(bond_idx, bond_types, self.THEOZYME_SIZE)
+
+            return elem, pos, adj
+        
+        return 0, 0, 0 # cringe
 
 if __name__ == '__main__':
     collector = Collector()
