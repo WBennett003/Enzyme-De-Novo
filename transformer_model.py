@@ -1,4 +1,5 @@
 import torch
+import wandb
 
 def look_ahead_mask(shape):
   mask = torch.arange(shape)[None, :] > torch.arange(shape)[:, None]
@@ -19,15 +20,8 @@ def scaled_product_attention(q, k, v, weights=None, mask=None, padding_mask=None
   x = torch.matmul(q, torch.einsum('ijk->ikj', k))
   x = x/k.shape[1]**0.5
 
-  if mask is not None:
-    mask = mask.long()
-    zeros = torch.zeros((x.shape[0], x.shape[1], x.shape[2]))
-    # zeros = torch.ones(x.shape) * float('-inf')
-    for b in range(x.shape[0]):
-      wa = (x[b, mask[b, 0, :], mask[b, 1, :]][:, None] * weights[b])
-      wa = wa.sum(axis=1)
-      zeros[b, mask[b, 0, :], mask[b, 1, :]] = wa
-    x = zeros
+  if weights is not None:
+    x = (x[:, :, :, None] * weights).sum(-1)
 
   if look_ahead_mask is not None:
     x[:, look_ahead_mask] = float('-inf')      
@@ -55,13 +49,13 @@ class Graph_Attention(torch.nn.Module):
 
     self.out = torch.nn.Linear(self.insize*nheads, self.outsize)
 
-  def forward(self, nodefeatures, node_indices, nodeattributes, padding_mask=None, look_ahead_mask=None):
+  def forward(self, nodefeatures, nodeadj, padding_mask=None, look_ahead_mask=None):
     qkv = []
     for head in range(self.nheads):
       wq = self.wq[head](nodefeatures)#.relu()
       wk = self.wk[head](nodefeatures)#.relu()
       wv = self.wv[head](nodefeatures)#.relu() 
-      attn = self.attn(wq, wk, wv, mask=node_indices, weights=nodeattributes, look_ahead_mask=look_ahead_mask)
+      attn = self.attn(wq, wk, wv, weights=nodeadj, look_ahead_mask=look_ahead_mask)
   
       qkv.append(attn)
     qkv = torch.concat(qkv, axis=-1)
@@ -98,7 +92,7 @@ class MHA(torch.nn.Module):
     return qkv
 
 class compound_layer(torch.nn.Module):
-  def __init__(self, dmodel, nheads, elem_size, n_bond_types, charge_size):
+  def __init__(self, dmodel, nheads, elem_size, n_bond_types, charge_size, dff):
     super().__init__()
     self.elem_embedding = torch.nn.Embedding(elem_size, dmodel)
     
@@ -121,43 +115,45 @@ class compound_layer(torch.nn.Module):
     self.bonding_layer = Graph_Attention(dmodel, dmodel, nheads=nheads)
 
 
-  def forward(self, CE, CC, CP, CBI, CBT):
+  def forward(self, CE, CC, CP, CADJ):
     padding_mask = get_padding(CE)
     CE = self.elem_embedding(CE)
     CC = self.charge_layer(CC)
     CP = self.pos_layer(CP)
 
-    CB = self.bond_embedding(CBT)
+    CB = self.bond_embedding(CADJ)
 
     C = torch.concat([CE, CC, CP], axis=-1)
     C = self.ff(C)
 
-    C = self.bonding_layer(C, CBI, CB, padding_mask=padding_mask)
+    C = self.bonding_layer(C, CB, padding_mask=padding_mask)
 
     return C
 
 class theozyme_layer(torch.nn.Module):
-  def __init__(self, dff, nheads, elem_size, n_bond_types):
+  def __init__(self, dmodel, nheads, elem_size, n_bond_types, dff):
     super().__init__()
-    self.elem_embedding = torch.nn.Embedding(elem_size, dff)
+    self.elem_embedding = torch.nn.Embedding(elem_size, dmodel)
+    self.bonding_embedding = torch.nn.Embedding(n_bond_types, dmodel)
     self.pos_layer = torch.nn.Sequential(
-      torch.nn.Linear(3, dff),
+      torch.nn.Linear(3, dmodel),
       torch.nn.ReLU()
     )
     self.ff = torch.nn.Sequential(
-      torch.nn.Linear(2*dff, dff),
-      torch.nn.ReLU()      
+      torch.nn.Linear(2*dmodel, dmodel),
+      torch.nn.ReLU(),
     )
-    self.bonding_layer = Graph_Attention(dff, dff, nheads=nheads)
+    self.bonding_layer = Graph_Attention(dmodel, dmodel, nheads=nheads)
 
-  def forward(self, TE, TP, TBI, TBT):
+  def forward(self, TE, TP, TADJ):
     padding_mask = get_padding(TE)
     mask = look_ahead_mask(TE.shape[1])
     TE = self.elem_embedding(TE)
     TP = self.pos_layer(TP)
     T = torch.concat([TE, TP], axis=-1)
     T = self.ff(T)
-    T = self.bonding_layer(T, TBI, TBT, padding_mask=padding_mask, look_ahead_mask=mask)
+    TB = self.bonding_embedding(TADJ)
+    T = self.bonding_layer(T, TB, padding_mask=padding_mask, look_ahead_mask=mask)
     return T
 
 class encoder_layer(torch.nn.Module):
@@ -267,32 +263,32 @@ class Transformer(torch.nn.Module):
         self.nheads = nheads
         self.nblocks = nblocks
 
-        self.reactant_layer = compound_layer(dmodel, nheads, elem_size, nbonds, charge_size)
-        self.product_layer = compound_layer(dmodel, nheads, elem_size, nbonds, charge_size)
+        self.reactant_layer = compound_layer(dmodel, nheads, elem_size, nbonds, charge_size, dff)
+        self.product_layer = compound_layer(dmodel, nheads, elem_size, nbonds, charge_size, dff)
 
         self.compound_layer = torch.nn.Sequential(
           torch.nn.Linear(2*dmodel, dmodel),
           torch.nn.ReLU()
         )
         
-        self.theozyme_layer = theozyme_layer(dmodel, nheads, elem_size, nbonds)
+        self.theozyme_layer = theozyme_layer(dmodel, nheads, elem_size, nbonds, dff)
 
         self.encoder = [encoder_layer(dmodel, nheads, dff) for i in range(nblocks)]
         self.decoder = [decoder_layer(dmodel, nheads, dff) for i in range(nblocks)]
 
         self.output = Transducer(theozyme_size, nbonds, elem_size, dmodel=dmodel, dff=dff)
 
-    def forward(self, RE, RC, RP, RBI, RBT, PE, PC, PP, PBI, PBT, TE, TP, TBI, TBT):
+    def forward(self, RE, RC, RP, RADJ, PE, PC, PP, PADJ, TE, TP, TADJ):
         mask = look_ahead_mask(self.theozyme_size)
 
-        rx = self.reactant_layer(RE, RC, RP, RBI, RBT)
+        rx = self.reactant_layer(RE, RC, RP, RADJ)
 
-        px = self.product_layer(PE, PC, PP, PBI, PBT)
+        px = self.product_layer(PE, PC, PP, PADJ)
         
         x = torch.concat([rx, px], axis=-1)
         x = self.compound_layer(x)
 
-        target_x = self.theozyme_layer(TE, TP, TBI, TBT)
+        target_x = self.theozyme_layer(TE, TP, TADJ)
         
         for encoder in self.encoder:
           x = encoder(x)
@@ -303,6 +299,64 @@ class Transformer(torch.nn.Module):
         xe, xp, xbonding = self.output(target_x)
 
         return xe, xp, xbonding
+
+    def train(self, dataset, epochs=10, batch_size=10, learning_rate=0.02, weights_dir=None):
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_szie, shuffle=True)
+        
+        if weights_dir is not None:
+            self.load_state_dict(torch.load(weights_dir))
+
+        loss_func_elemnt = torch.nn.CrossEntropyLoss()
+        loss_func_bonding = torch.nn.CrossEntropyLoss()
+        loss_func_pos = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning)
+
+        batch_length = len(loader)
+
+        outputs = []
+        losses = []
+        avg_loss = []
+
+        for epoch in range(epochs):
+            count = 0
+            for RE, RC, RP, RADJ, PE, PC, PP, PADJ, TE, TP, TADJ in loader:
+                tgtE, tgtP, tgtADJ = get_target(TE, TP, TADJ, THEOZYME_SIZE)
+
+                pred_elem, pred_pos, pred_bonding = model(RE, RC, RP, RADJ, PE, PC, PP, PADJ, tgtE, tgtP, tgtADJ)
+
+                loss_elem = loss_func_elemnt(pred_elem, torch.nn.functional.one_hot(TE.long(), ELEMENT_SIZE).float())
+                loss_pos = loss_func_pos(pred_pos, TP)
+                loss_bonding = loss_func_pos(pred_bonding, torch.nn.functional.one_hot(TADJ.long(), BOND_SIZE).float())
+                loss = loss_elem + loss_bonding + loss_pos
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                losses.append([loss_elem.detach().numpy(), loss_pos.detach().numpy(), loss_bonding.detach().numpy()])
+                print(f"{count}/{batch_length} : loss {loss.detach().numpy()}")
+                count += 1
+                
+            print(f"epoch {epoch} : loss {loss_elem, loss_pos, loss_bonding}")
+            torch.save(model.state_dict(), 'weights/transformer.pt')
+            start = batch_length * epoch
+            end = batch_length * (epoch+1)
+            temp_losses = np.array(losses[start:end])
+            avg_loss.append([
+                temp_losses[0].mean(),
+                temp_losses[1].mean(),
+                temp_losses[2].mean(),
+                temp_losses[3].mean(),
+            ])
+
+            wandb.log({
+                "epoch" : epoch,
+                "loss" : avg_loss[epoch][0],
+                "loss-elem" : avg_loss[epoch][1],
+                "loss-pos" : avg_loss[epoch][2],
+                "loss-pos" : avg_loss[epoch][3],
+                "weights" : self.state_dict()
+            })
 
 def get_padding(element): #arg element : (Batch size, sequence length, int)
   lengths = element.argmin(1)#gets length of nonpadded array, as it returns the index of the first zero

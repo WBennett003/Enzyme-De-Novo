@@ -180,8 +180,16 @@ def create_graph_from_mol(chebi_id, bond_types, stero_types, charge_range, path=
 
     return elem, charge, pos, bond_index, bond_types
 
-def convert_coo_aj(coo, data, max_length): #takes indicies for sparse tensor
+def dense_bonding(idx, types, max_lengths=1000):
+    adj_matrix = np.zeros((max_lengths, max_lengths))
+    for i, bond in enumerate(types):
+        adj_matrix[idx[i][0], idx[i][1]] = bond
+        adj_matrix[idx[i][1], idx[i][0]] = bond
+    return adj_matrix
     
+
+def convert_coo_aj(coo, data, max_length): #takes indicies for sparse tensor
+
     if coo.shape[0] != 2:
         zeros = np.zeros((coo.shape[0], max_length, max_length))
     else:
