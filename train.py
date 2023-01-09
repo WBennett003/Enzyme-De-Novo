@@ -7,7 +7,12 @@ import time
 import wandb
 
 from transformer_model import Transformer
-#simple proof of concept model
+from visualisation import plot_prediction, plot_elem_confusion, plot_bonding_confusion, plot_bonding_matrix
+
+if torch.cuda.is_available():
+  dev = "CUDA:0"
+else:
+  dev = "CPU"
 
 class dataset(torch.utils.data.Dataset):
   def __init__(self, file_path='datasets/dense_bonding10page.h5py'):
@@ -32,19 +37,20 @@ def get_target(TE, TP, TBI, max_length=1000):
 
   return TE, TP, TBI
 
-THEOZYME_SIZE = 1000
-COMPOUND_SIZE = 1000
-ELEMENT_SIZE = 30
-BOND_SIZE = 8
+#Hyperparameters
+THEOZYME_SIZE = 250
+COMPOUND_SIZE = 250
+ELEMENT_SIZE = 16
+BOND_SIZE = 4
 
-NHEADS = 1
-NBLOCKS = 1
-DMODEL  = 5 #embedding size
-DFF = 10 #high dim upscale in fead forward layer
+NHEADS = 6
+NBLOCKS = 6
+DMODEL  = 255 #embedding size
+DFF = 2056 #high dim upscale in fead forward layer
 
-BATCH_SIZE = 1
+BATCH_SIZE = 10
 LEARNING_RATE = 0.02
-EPOCHS = 5
+EPOCHS = 20
 
 wandb.init(
     # set the wandb project where this run will be logged
@@ -52,6 +58,10 @@ wandb.init(
     
     # track hyperparameters and run metadata
     config={
+    "elems" : ELEMENT_SIZE,
+    "bonds" : BOND_SIZE,
+    "theozyme size" :  THEOZYME_SIZE,
+    "compound size" : COMPOUND_SIZE,
     "learning_rate": LEARNING_RATE,
     "n_heads": NHEADS,
     "n_blocks": NBLOCKS,
@@ -100,32 +110,31 @@ for epoch in range(epochs):
     optimizer.step()
 
     losses.append([loss_elem.detach().numpy(), loss_pos.detach().numpy(), loss_bonding.detach().numpy()])
-    print(f"{count}/{batch_length} : loss {loss.detach().numpy()} : {round(time.time()-start, 2)}s")
+    print(f"{count}/{batch_length} : loss {loss} : {round(time.time()-start, 2)}s")
     count += 1
 
-  print(f"epoch {epoch} : loss {loss_elem, loss_pos, loss_bonding}")
-  torch.save(model.state_dict(), 'weights/transformer.pt')
   start = batch_length * epoch
   end = batch_length * (epoch+1)
   temp_losses = np.array(losses[start:end])
   avg_loss.append([
-      temp_losses[0].mean(),
-      temp_losses[1].mean(),
-      temp_losses[2].mean(),
-      temp_losses[3].mean(),
+      temp_losses[:, 0].mean(),
+      temp_losses[:, 1].mean(),
+      temp_losses[:, 2].mean(),
   ])
+  print(f"epoch {epoch} : loss {avg_loss[epoch]}")
+  elem_fig = plot_elem_confusion(TE, pred_elem.argmax(-1), get_figure=True, n_elems=ELEMENT_SIZE)
+  bond_fig = plot_bonding_confusion(TADJ, pred_bonding.argmax(-1), get_figure=True, n_bonds=BOND_SIZE)
+  matrix_fig = plot_bonding_matrix(TADJ[0], pred_bonding[0].argmax(-1), get_figure=True)
 
   wandb.log({
       "epoch" : epoch,
-      "loss" : avg_loss[epoch][0],
-      "loss-elem" : avg_loss[epoch][1],
-      "loss-pos" : avg_loss[epoch][2],
-      "loss-pos" : avg_loss[epoch][3],
-      "weights" : model.state_dict()
+      "loss" : sum(avg_loss[epoch]),
+      "loss-elem" : avg_loss[epoch][0],
+      "loss-pos" : avg_loss[epoch][1],
+      "loss-bonding" : avg_loss[epoch][2],
+      "elem_figure" : wandb.Image(elem_fig),
+      "bond_figure" : wandb.Image(bond_fig),
+      "maxtrix_figure" : wandb.Image(matrix_fig),
   })
-n = 10
-losses = np.array(losses).T
-plt.plot(np.arange(n), losses[0, -n:, ])
-plt.plot(np.arange(n), losses[1, -n:, ])
-plt.plot(np.arange(n), losses[2, -n:, ])
-plt.show()
+  torch.save(model.state_dict(), 'weights/transformer.pt')
+

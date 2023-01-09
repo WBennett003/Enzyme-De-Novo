@@ -7,6 +7,7 @@ class Element_Tokeniser():
         'A', 'B', 'G', 'D', 'E', 'Z'
     ]
 
+
     def __init__(self, dict_path='PERIODIC.json'):
         self.dict_path = dict_path
         if not os.path.isfile(self.dict_path):
@@ -20,6 +21,12 @@ class Element_Tokeniser():
         if len(element) > 1:
             if element[1] in self.position_chars:
                 return element[0]
+            elif element[1].isdigit():
+                return element[0]
+            elif element[1].lower() != element[1]:
+                return element[0]
+            elif element[1].lower() == element[1] and len(element) == 3:
+                return element[:-1]
             else:
                 return element
         else:

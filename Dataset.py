@@ -14,8 +14,8 @@ ELEMENT_TOKENISER = Element_Tokeniser('datasets/PERIODIC.json')
 THEOZYME_TOKENISER = Theozyme_Tokeniser('datasets/THEOZYME.json')
 
 class Collector():
-    def __init__(self, COMPOUND_SIZE=1000,
-    COMPOUND_CHANNELS=5, THEOZYME_SIZE=1000, THEOZYME_CHANNELS=7, N_BOND_TYPES=8,
+    def __init__(self, COMPOUND_SIZE=250,
+    COMPOUND_CHANNELS=5, THEOZYME_SIZE=250, THEOZYME_CHANNELS=7, N_BOND_TYPES=8,
     N_STERO_TYPES=8, CHARGE_RANGE=(-4,+4),file_dir='datasets/dense_bonding10page.h5py',
      enzyme_url='https://www.ebi.ac.uk/thornton-srv/m-csa/api/entries/?format=json'):
         self.COMPOUND_SIZE = COMPOUND_SIZE
@@ -31,7 +31,7 @@ class Collector():
         self.builder = Builder()
         self.file = h5py.File(file_dir, 'w')
 
-        self.process_response(11)
+        self.process_response(7)
         self.close_file()
 
     def combine_compounds(self, compounds):
@@ -57,9 +57,13 @@ class Collector():
             compound_bond_index.extend(global_bond_idx)
             compound_bond_types.extend(bond_type)
 
-        compound_adj = dense_bonding(compound_bond_index, compound_bond_types, self.COMPOUND_SIZE)
-
         compound_elem, compound_charge, compound_pos = self.preprocess_compound(compound_elem, compound_charge, compound_pos)
+        
+        if len(compound_elem) == 0:
+            return [], [], [], []
+        else:
+            compound_adj = dense_bonding(compound_bond_index, compound_bond_types, self.COMPOUND_SIZE)
+
 
         return compound_elem, compound_charge, compound_pos, compound_adj
 
@@ -68,12 +72,6 @@ class Collector():
         url = url + '&page=' + str(i)
         return requests.get(url).json()['results']
 
-    def get_transition_state(self, rc, pc, rbidx, pbidx, rbt, pbt):
-        tc = (rc + pc) / 2 #takes the avg charge between reactant and products
-        same = []
-        different = []
-        pass
-
     def close_file(self):
         self.file.close()
 
@@ -81,6 +79,8 @@ class Collector():
         max_length = self.COMPOUND_SIZE
         assert len(element) == len(charge) and len(element) == len(position)
         length = len(element)
+        if length > max_length:
+            return [], [], []
 
         blank = np.zeros(max_length, dtype='int32') #np.repeat(int('-inf'), max_length)
         blank[:length] = element
@@ -91,7 +91,7 @@ class Collector():
         charge = blank
 
         blank = np.zeros((max_length, 3), dtype='float32')
-        blank[:length] = np.array(position)
+        blank[:length] = self.scaler.fit_transform(np.array(position))
         position = blank
         return element, charge, position
 
@@ -120,17 +120,27 @@ class Collector():
                 compounds = result['reaction']['compounds']
                 reactants, products = fetch_molecules(compounds)
 
+                if len(products) == 0:
+                    print(f"Error, no products found {compounds}")
+                    break
+
                 if len(reactants) == 0:
-                    print(f"Error, no reactants found")
+                    print(f"Error, no reactants found {compounds}")
                     break
 
                 reactant_elem, reactant_charge, reactant_pos, reactant_adj = self.combine_compounds(reactants)
                 
-                if len(products) == 0:
-                    print(f"Error, no products found")
-                    break
+
                     
                 product_elem, product_charge, product_pos, product_adj = self.combine_compounds(products)
+
+                if len(product_elem) == 0:
+                    print(f"Error, products failed {len(products)}")
+                    break
+
+                if len(reactant_elem) == 0:
+                    print(f"Error, reactants failed {len(reactants)}")
+                    break
 
                 proteins = get_theozyme(result)
 
@@ -151,6 +161,8 @@ class Collector():
                         self.save_dataset('theozyme_elem', elem)
                         self.save_dataset('theozyme_pos', pos)
                         self.save_dataset('theozyme_adj', adj)
+                    else:
+                        print(f"protein failed {[protein]}")
 
         print(f"dataset shapes : \n {[[x, self.file[x].shape] for x in self.file.keys()]}")
 
@@ -162,11 +174,12 @@ class Collector():
 
     def generate_theozyme(self, pdb_id, ress, threshold=0):   
         pdb_data = download_protein(pdb_id)
+        ress = sort(ress)
         if pdb_data == '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">\n<html>\n  <head>\n    <title>404 Not Found</title>\n  </head>\n  <body>\n    <h1>Not Found</h1>\n    <p>The requested URL was not found on this server.</p>\n    <hr>\n    <address>RCSB PDB</address>\n  </body>\n</html>\n':
             return 0, 0, 0
         atoms = pdb_data.split('\n')
         mutations = []
-
+        
         elem = []
         res = []
         charge = []
@@ -175,6 +188,8 @@ class Collector():
         idx = 0
         next_res = ress[idx]
         last_i = -1
+        last_rand_i = 0
+        wrong_res = []
         for atom in atoms:
             if atom[:4] == 'ATOM':
                 a = atom[13:16].replace(' ', '')
@@ -185,43 +200,57 @@ class Collector():
                 z = float(atom[46:55])
                 t = float(atom[60:66])
                 
-                if i != last_i and idx < len(ress)-1:
+                if i == last_i+1 and idx < len(ress)-1 and last_rand_i != i:
                     idx += 1
                     next_res = ress[idx]
 
-                elif i == next_res[0]:
+                if i == next_res[0]:
                     last_i = i
                     if r == next_res[1]:
                         elem.append(a)
                         res.append(r)
                         pos.append([x,y,z])
-                    else:
+                    elif next_res not in wrong_res:
+                        wrong_res.append(next_res)
                         print(f"wrong residue at position {i} got {r} instead of {next_res[1]}")
                         mutations.append(next_res)
+
+                last_rand_i = i
 
 
         if len(mutations) <= threshold and len(res) != 0:
             bond_idx, bond_types = self.builder.build_pdb2(elem, res)
+            if len(bond_idx) == 0:
+                return 0, 0, 0
+                
             tokenised_elem = []
             
             for i in range(len(elem)):
                 tokenised_elem.append(ELEMENT_TOKENISER.tokenise(elem[i]))
             
             n_atoms = len(elem)
+            if n_atoms > self.THEOZYME_SIZE:
+                return 0, 0, 0
 
             zeros = np.zeros(self.THEOZYME_SIZE)#np.repeat(int('-inf'), self.THEOZYME_SIZE)
             zeros[:len(tokenised_elem)] = tokenised_elem
             elem = np.array(zeros)
 
-            zeros = np.repeat([0, 0, 0], self.THEOZYME_SIZE).reshape((self.THEOZYME_SIZE, 3))
-            zeros[:len(pos)] = pos
-            pos = np.array(zeros)
+            zeros = np.zeros((self.THEOZYME_SIZE, 3))
+            zeros[:len(pos)] = self.scaler.fit_transform(np.array(pos))
+            pos = zeros
 
             adj = dense_bonding(bond_idx, bond_types, self.THEOZYME_SIZE)
 
             return elem, pos, adj
         
         return 0, 0, 0 # cringe
+
+def last(n):
+    return n[0]
+
+def sort(tuples):
+    return sorted(tuples, key=last)
 
 if __name__ == '__main__':
     collector = Collector()
